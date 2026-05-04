@@ -1,0 +1,171 @@
+/* PASO 1: LIMPIEZA INICIAL */ 
+data WORK.BASE_LIMPIA; 
+    set WORK.IMPORT; 
+    array vars[*] _NUMERIC_;  
+    do i=1 to dim(vars); 
+        if vars[i] <= 0 then vars[i] = .;  
+    end; 
+    drop i; 
+run; 
+
+/* PASO 2: SCREENING VISUAL */ 
+proc univariate data=WORK.BASE_LIMPIA plot;  
+    var RTO GH ESTAB W CEN RH VOL PH PMG PROT;  
+run; 
+
+/* PASO 3: TRANSFORMACIONES (Según lo visto en Paso 2) */ 
+data WORK.BASE_FINAL; 
+    set WORK.BASE_LIMPIA; 
+    log_ESTAB = log(ESTAB); 
+    /* log_W = log(W); */ /* Descomentar si el screening lo pide */ 
+run; 
+
+/* PASO 4: LA MACRO PARA VALIDAR SUPUESTOS */ 
+%macro validar_supuestos(variable, tipo=completo); 
+    proc mixed data=WORK.BASE_FINAL method=reml; 
+        class Cultivar Año Loc; 
+        model &variable = Cultivar / residual; 
+        %if &tipo = completo %then %do; 
+            random Año Loc Año*Loc Cultivar*Año Cultivar*Loc; 
+        %end; 
+        %else %do; 
+            random Año Loc; 
+        %end; 
+        lsmeans Cultivar; 
+        ods output LSMeans = Med_&variable; 
+    run; 
+%mend; 
+ 
+%validar_supuestos(RTO); 
+%validar_supuestos(PROT); 
+%validar_supuestos(GH); 
+%validar_supuestos(CEN); 
+%validar_supuestos(RH); 
+%validar_supuestos(VOL); 
+%validar_supuestos(PMG); 
+%validar_supuestos(log_ESTAB);  
+%validar_supuestos(PH, tipo=simple);
+%validar_supuestos(W); 
+
+/* PASO 5: UNIÓN DE RESULTADOS (MERGE) */ 
+data WORK.MATRIZ_PARA_ACP; 
+  merge  
+    Med_RTO    (rename=(Estimate=Rendimiento)    keep=Cultivar Estimate) 
+    Med_PROT   (rename=(Estimate=Proteina)       keep=Cultivar Estimate) 
+    Med_GH     (rename=(Estimate=Gluten_Humedo)  keep=Cultivar Estimate) 
+    Med_log_ESTAB (rename=(Estimate=Estabilidad) keep=Cultivar Estimate) 
+    Med_CEN   (rename=(Estimate=Cenizas)         keep=Cultivar Estimate) 
+    Med_RH    (rename=(Estimate=Rend_Harinero)   keep=Cultivar Estimate) 
+    Med_VOL   (rename=(Estimate=Volumen_Pan)     keep=Cultivar Estimate) 
+    Med_PMG   (rename=(Estimate=Peso_1000)       keep=Cultivar Estimate) 
+    Med_PH    (rename=(Estimate=Peso_Hect)       keep=Cultivar Estimate) 
+    Med_W     (rename=(Estimate=Fuerza_W)        keep=Cultivar Estimate) 
+    ; 
+    by Cultivar; 
+run; 
+
+/* --- PASO 6: NORMALIZACIÓN DE DATOS Y CONSTRUCCIÓN DEL ÍNDICE DE MÉRITO--- */ 
+proc means data=WORK.MATRIZ_PARA_ACP noprint; 
+    var Rendimiento Proteina Gluten_Humedo Estabilidad Fuerza_W Cenizas 
+        Rend_Harinero Volumen_Pan Peso_1000 Peso_Hect; 
+    output out=WORK.GlobalMinMax 
+       min(Rendimiento Proteina Gluten_Humedo Estabilidad Fuerza_W Cenizas Rend_Harinero Volumen_Pan Peso_1000 Peso_Hect) =  
+       max(Rendimiento Proteina Gluten_Humedo Estabilidad Fuerza_W Cenizas Rend_Harinero Volumen_Pan Peso_1000 Peso_Hect) =  
+       / autoname; 
+run; 
+ 
+data WORK.RANKING_0_1; 
+    if _n_ = 1 then set WORK.GlobalMinMax; 
+    set WORK.MATRIZ_PARA_ACP; 
+ 
+    /* Normalización 0 a 1 */ 
+    /* Nota: Usamos los nombres que genera AUTONAME (Variable_Min y Variable_Max) */ 
+    nRto  = (Rendimiento - Rendimiento_Min) / (Rendimiento_Max - Rendimiento_Min); 
+    nProt = (Proteina - Proteina_Min) / (Proteina_Max - Proteina_Min); 
+    nGH   = (Gluten_Humedo - Gluten_Humedo_Min) / (Gluten_Humedo_Max - Gluten_Humedo_Min); 
+    nEst  = (Estabilidad - Estabilidad_Min) / (Estabilidad_Max - Estabilidad_Min); 
+    nW    = (Fuerza_W - Fuerza_W_Min) / (Fuerza_W_Max - Fuerza_W_Min); 
+    nVol  = (Volumen_Pan - Volumen_Pan_Min) / (Volumen_Pan_Max - Volumen_Pan_Min); 
+    nPMG  = (Peso_1000 - Peso_1000_Min) / (Peso_1000_Max - Peso_1000_Min); 
+    nPH   = (Peso_Hect - Peso_Hect_Min) / (Peso_Hect_Max - Peso_Hect_Min); 
+    nRH   = (Rend_Harinero - Rend_Harinero_Min) / (Rend_Harinero_Max - Rend_Harinero_Min); 
+     
+    /* Inversa para Cenizas (Menos es mejor) */ 
+    nCen  = (Cenizas_Max - Cenizas) / (Cenizas_Max - Cenizas_Min); 
+ 
+    /* ÍNDICES */ 
+    Indice_Multicaracter = mean(nProt, nGH, nEst, nW, nVol, nPMG, nPH, nRH, nCen); 
+    Indice_Merito  = (0.5 * nRto) + (0.5 * Indice_Multicaracter); 
+run; 
+
+/* -- PASO 7: REPRESENTACIÓN GRÁFICA Y SELECCIÓN DE CULTIVARES ELITE- */ 
+proc sort data=WORK.RANKING_0_1 out=WORK.ORDENADO; 
+    by descending Indice_Merito; 
+run; 
+ 
+data WORK.DATA_GRAFICO_TOTAL; 
+    set WORK.ORDENADO; 
+    /* Creamos dos columnas de coordenadas separadas */ 
+    if _n_ <= 20 then do; 
+        nRto_Top = nRto; 
+        nCal_Top = Indice_Multicaracter; 
+        Etiqueta_Top20 = Cultivar; 
+        Grupo = "Top 20"; 
+    end; 
+    else do; 
+        /* El resto de la población va a estas variables */ 
+        nRto_Pob = nRto; 
+        nCal_Pob = Indice_Multicaracter; 
+        Grupo = "Resto"; 
+    end; 
+run; 
+ 
+/* Re-calculamos medias (Paso necesario igual que antes) */ 
+proc means data=WORK.DATA_GRAFICO_TOTAL noprint; 
+    var nRto Indice_Multicaracter; 
+    output out=WORK.MediasRef mean=mRto mCal; 
+run; 
+data _null_; set WORK.MediasRef; call symputx('RefRto', mRto); call symputx('RefCal', mCal); run; 
+ 
+/* EL GRÁFICO DEFINITIVO */ 
+ods graphics on / reset width=900px height=900px; 
+proc sgplot data=WORK.DATA_GRAFICO_TOTAL; 
+     
+    /* 1. Dibujamos la población (Gris y Vacío) usando sus variables específicas */ 
+    scatter x=nCal_Pob y=nRto_Pob /  
+            markerattrs=(symbol=Circle color=black size=8)  
+            transparency=0.2 name="poblacion"; 
+     
+    /* 2. Dibujamos el Top 20 (Negro y Relleno) arriba de la capa anterior */ 
+    scatter x=nCal_Top y=nRto_Top /  
+            datalabel=Etiqueta_Top20 
+            markerattrs=(symbol=CircleFilled size=9 color=black) 
+            name="top"; 
+ 
+    /* 3. Líneas de referencia */ 
+    refline &RefCal. / axis=x lineattrs=(pattern=dash color=darkred thickness=1.5) label="Media Multicaracter"; 
+    refline &RefRto. / axis=y lineattrs=(pattern=dash color=darkred thickness=1.5) label="Media Rinde"; 
+ 
+    xaxis label="Calidad Multivariable Normalizada (0-1)" min=-0.05 max=1.05; 
+    yaxis label="Rendimiento Normalizado (0-1)" min=-0.05 max=1.05; 
+    title "Matriz de Selección: Top 20 sobre el Total de Ensayos"; 
+run; 
+ods graphics off;
+
+/* TABLA DEL TOP 20 CON PUNTUACIONES */ 
+proc report data=WORK.DATA_GRAFICO_TOTAL (obs=20) nowd; 
+    column Cultivar Indice_Merito nRto Indice_Multicaracter; 
+    define Cultivar       / "Cultivar" display; 
+    define Indice_Merito  / "Índice de Mérito" format=8.3; 
+    define nRto           / "Rendimiento (0-1)" format=8.3; 
+    define Indice_Multicaracter / "Calidad (0-1)" format=8.3; 
+    title "Tabla 1: Ranking de los 20 mejores cultivares según su mérito de rendimientoy calidad"; 
+run;
+
+/* - PASO 8: MATRIZ DE CORRELACIÓN (VARIABLES ORIGINALES - TOP 20) - */ 
+proc corr data=WORK.DATA_GRAFICO_TOTAL(obs=20) pearson;  
+    var Rendimiento Proteina Fuerza_W Gluten_Humedo Estabilidad  
+        Volumen_Pan Rend_Harinero Peso_Hect Peso_1000 Cenizas;  
+    title "Matriz de Correlación: Variables Originales (Top 20)";  
+run;
+
